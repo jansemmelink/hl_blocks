@@ -32,6 +32,7 @@ typedef enum hl_blocks_error_enum_s {
     HL_BLOCKS_K_ERROR_CORRUPTED = -1,
     HL_BLOCKS_K_ERROR_READ_ALL = -2,
     HL_BLOCKS_K_ERROR_READ_BUFF_TOO_SMALL = -3,
+    HL_BLOCKS_K_ERROR_NO_SPACE_LEFT_IN_BUFFER = -4,
     /*
      * terminator
      */

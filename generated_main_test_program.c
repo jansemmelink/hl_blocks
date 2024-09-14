@@ -121,5 +121,29 @@ int main(int argc, const char* arg_apc[]) {
         }
     }
     
+    if (m_r_must_run_test (argc, arg_apc, "test_r_write_and_read_over_buffer_rotation")) {
+        printf("\n\n===== TEST: test_r_write_and_read_over_buffer_rotation ======\n");
+        if (test_r_write_and_read_over_buffer_rotation() != 0)
+        {
+            printf ("test_r_write_and_read_over_buffer_rotation FAILED.\n");
+            error_stack_r_print (stderr);
+            exit (1);
+        } else {
+            printf ("test_r_write_and_read_over_buffer_rotation PASSED.\n");
+        }
+    }
+    
+    if (m_r_must_run_test (argc, arg_apc, "test_r_write_too_much_but_continue_safely")) {
+        printf("\n\n===== TEST: test_r_write_too_much_but_continue_safely ======\n");
+        if (test_r_write_too_much_but_continue_safely() != 0)
+        {
+            printf ("test_r_write_too_much_but_continue_safely FAILED.\n");
+            error_stack_r_print (stderr);
+            exit (1);
+        } else {
+            printf ("test_r_write_too_much_but_continue_safely PASSED.\n");
+        }
+    }
+    
     return SUCCESS();
 }/*main*/

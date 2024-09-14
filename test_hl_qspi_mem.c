@@ -194,7 +194,7 @@ TEST(write_two_messages_then_read_both) {
 TEST(first_msg_span_into_2nd_block) {
     START(
         64,     //block size
-        2,      //nr of blocks
+        4,      //nr of blocks
         64,     //max message size
         32);    //min data per message part
 
@@ -635,12 +635,351 @@ TEST(cold_start_with_large_messages_in_later_blocks) {
     return m_r_cleanup (&l_blocks_pz);
 }//TEST()
 
+TEST(write_and_read_over_buffer_rotation) {
+    START(
+        128,    //block size
+        4,      //nr of blocks
+        128,    //max message size
+        16);    //min data per message part
 
-//TODO: write until rotate and read over rotation
+    const uint32_t l_test_msg_len_ud = 50;
 
-//TODO: write until rotate and read a bit, then start cold and read the rest over rotation
+    //write into all blocks, not yet rotating, because there would be no space to rotate
+    int l_next_wr_id_d = 0;
+    int l_next_rd_id_d = 0;
+    for (int i = 0; i < 3; i ++)
+    {
+        char                        l_msg_ac[100];
+        m_r_make_test_msg (l_msg_ac, sizeof (l_msg_ac), l_next_wr_id_d, l_test_msg_len_ud);
+        size_t l_len_ud = strlen(l_msg_ac);
+        hl_blocks_msg_seq_t l_write_seq_ud = 0;
+        if (hl_blocks_r_write (
+                l_blocks_pz,
+                l_msg_ac, l_len_ud + 1,
+                &l_write_seq_ud)
+                != 0)
+            return ERROR(-1,
+                "failed to write msg[%d]", l_next_wr_id_d);
 
-//TODO: write until rotate without reading...
+        l_next_wr_id_d ++;
+    }/*for each messages to write*/
+
+    //now read and write, which release some space then write more
+    for (int i = 0; i < 100; i ++)
+    {
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+
+        //write another message
+        char                        l_msg_ac[100];
+        m_r_make_test_msg (l_msg_ac, sizeof (l_msg_ac), l_next_wr_id_d, l_test_msg_len_ud);
+        size_t l_len_ud = strlen(l_msg_ac);
+        hl_blocks_msg_seq_t l_write_seq_ud = 0;
+        if (hl_blocks_r_write (
+                l_blocks_pz,
+                l_msg_ac, l_len_ud + 1,
+                &l_write_seq_ud)
+                != 0)
+            return ERROR(-1,
+                "failed to write msg[%d]", l_next_wr_id_d);
+
+        l_next_wr_id_d ++;
+    }/*for each messages to write*/
+
+    //now close and do a cold start then continue
+    DEBUG ("*** CLOSING ***");
+    if (hl_blocks_r_close (&l_blocks_pz) != 0)
+        return ERROR (-1,
+            "Failed to close before cold start");
+
+    DEBUG ("*** COLD START ***");
+    l_blocks_pz = NULL; //after shutdown, that instance is no longer
+
+    //now open blocks based on that same memory contents
+    if (hl_blocks_r_open (
+                128,
+                4,
+                128,
+                16,
+                m_r_block_write,
+                m_r_block_addr,
+                &l_blocks_pz)
+                != 0)
+        return ERROR(-1,
+            "failed to open blocks for cold start");
+
+    DEBUG ("*** CONTINUE ***");
+    //now read and write, which release some space then write more
+    for (int i = 0; i < 100; i ++)
+    {
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+
+            //the first message(s) after cold start, may already be read when the block
+            //was not completely read before shut down
+            //if so, skip them...
+            if (l_read_seq_ud < l_next_rd_id_d + 1) {
+                DEBUG ("Skip seq[%u] already read before shutdown.", l_read_seq_ud);
+                continue;
+            }
+
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+
+        //write another message
+        char                        l_msg_ac[100];
+        m_r_make_test_msg (l_msg_ac, sizeof (l_msg_ac), l_next_wr_id_d, l_test_msg_len_ud);
+        size_t l_len_ud = strlen(l_msg_ac);
+        hl_blocks_msg_seq_t l_write_seq_ud = 0;
+        if (hl_blocks_r_write (
+                l_blocks_pz,
+                l_msg_ac, l_len_ud + 1,
+                &l_write_seq_ud)
+                != 0)
+            return ERROR(-1,
+                "failed to write msg[%d]", l_next_wr_id_d);
+
+        l_next_wr_id_d ++;
+    }/*for each messages to write*/
+
+    //now read the last written message until the buffer is empty
+    while (l_next_rd_id_d != l_next_wr_id_d)
+    {
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+    }/*while emptying*/
+
+    ASSERT_NOTHING_MORE_TO_READ (l_blocks_pz);
+    return m_r_cleanup (&l_blocks_pz);
+}//TEST()
+
+
+//when reaching end of buffer, must be able to handle errors and continue
+TEST(write_too_much_but_continue_safely) {
+    START(
+        128,    //block size
+        4,      //nr of blocks
+        128,    //max message size
+        16);    //min data per message part
+
+    const uint32_t l_test_msg_len_ud = 50;
+
+    //write into all blocks, not yet rotating, because there would be no space to rotate
+    int l_next_wr_id_d = 0;
+    int l_next_rd_id_d = 0;
+    for (int i = 0; i < 100; i ++)
+    {
+        //write until run out of space
+        while (1)
+        {
+            char                        l_msg_ac[100];
+            m_r_make_test_msg (l_msg_ac, sizeof (l_msg_ac), l_next_wr_id_d, l_test_msg_len_ud);
+            size_t l_len_ud = strlen(l_msg_ac);
+            hl_blocks_msg_seq_t l_write_seq_ud = 0;
+            int l_write_result_d = hl_blocks_r_write (
+                    l_blocks_pz,
+                    l_msg_ac, l_len_ud + 1,
+                    &l_write_seq_ud);
+            if (l_write_result_d != 0)
+            {
+                if (l_write_result_d == HL_BLOCKS_K_ERROR_NO_SPACE_LEFT_IN_BUFFER)
+                    break;
+
+                return ERROR(-1,
+                    "failed to write msg[%d] with result=%d != ",
+                    l_next_wr_id_d,
+                    l_write_result_d,
+                    HL_BLOCKS_K_ERROR_NO_SPACE_LEFT_IN_BUFFER);
+            }
+            l_next_wr_id_d ++;
+        }//while can write
+
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+    }/*for each messages to write*/
+
+    //now close and do a cold start then continue
+    DEBUG ("*** CLOSING ***");
+    if (hl_blocks_r_close (&l_blocks_pz) != 0)
+        return ERROR (-1,
+            "Failed to close before cold start");
+
+    DEBUG ("*** COLD START ***");
+    l_blocks_pz = NULL; //after shutdown, that instance is no longer
+
+    //now open blocks based on that same memory contents
+    if (hl_blocks_r_open (
+                128,
+                4,
+                128,
+                16,
+                m_r_block_write,
+                m_r_block_addr,
+                &l_blocks_pz)
+                != 0)
+        return ERROR(-1,
+            "failed to open blocks for cold start");
+
+    DEBUG ("*** CONTINUE ***");
+    //now read and write, which release some space then write more
+    for (int i = 0; i < 100; i ++)
+    {
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+
+            //the first message(s) after cold start, may already be read when the block
+            //was not completely read before shut down
+            //if so, skip them...
+            if (l_read_seq_ud < l_next_rd_id_d + 1) {
+                DEBUG ("Skip seq[%u] already read before shutdown.", l_read_seq_ud);
+                continue;
+            }
+
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+
+        //write another message
+        char                        l_msg_ac[100];
+        m_r_make_test_msg (l_msg_ac, sizeof (l_msg_ac), l_next_wr_id_d, l_test_msg_len_ud);
+        size_t l_len_ud = strlen(l_msg_ac);
+        hl_blocks_msg_seq_t l_write_seq_ud = 0;
+        if (hl_blocks_r_write (
+                l_blocks_pz,
+                l_msg_ac, l_len_ud + 1,
+                &l_write_seq_ud)
+                != 0)
+            return ERROR(-1,
+                "failed to write msg[%d]", l_next_wr_id_d);
+
+        l_next_wr_id_d ++;
+    }/*for each messages to write*/
+
+    //now read the last written message until the buffer is empty
+    while (l_next_rd_id_d != l_next_wr_id_d)
+    {
+        //read one message and verify
+        {
+            char                        l_buf_ac[100];
+            size_t                      l_read_size_ud = 0;
+            hl_blocks_msg_seq_t         l_read_seq_ud = 0;
+            if (hl_blocks_r_read (
+                    l_blocks_pz,
+                    l_buf_ac, sizeof (l_buf_ac),
+                    &l_read_size_ud,
+                    &l_read_seq_ud)
+                    != 0)
+                return ERROR (-1,
+                    "failed to read msg[%d]", l_next_rd_id_d);
+
+            char                        l_exp_msg_ac[100];
+            m_r_make_test_msg (l_exp_msg_ac, sizeof (l_exp_msg_ac), l_next_rd_id_d, l_test_msg_len_ud);
+            size_t l_exp_len_ud = strlen(l_exp_msg_ac);
+            ASSERT_INT_EQ (l_next_rd_id_d + 1, l_read_seq_ud);
+            ASSERT_INT_EQ (l_exp_len_ud + 1, l_read_size_ud);
+            ASSERT_STR_EQ (l_exp_msg_ac, l_buf_ac);
+            l_next_rd_id_d ++;
+        }/*scope*/
+    }/*while emptying*/
+
+    ASSERT_NOTHING_MORE_TO_READ (l_blocks_pz);
+    return m_r_cleanup (&l_blocks_pz);
+}//TEST()
 
 
 static int m_r_start (

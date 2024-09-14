@@ -212,10 +212,11 @@ extern int hl_blocks_r_open (
 extern int hl_blocks_r_close (
           hl_blocks_t**               p_blocks_ppz)
 {
-    //todo: write partial block
     hl_blocks_t* l_blocks_pz = *p_blocks_ppz;
-    if (l_blocks_pz->wr_blk_used_ud > 0)
-        return ERROR (-1, "Not yet able to sync on close...");  //todo!
+    int l_result_d;
+    l_result_d = hl_blocks_r_sync (l_blocks_pz);
+    if (l_result_d != 0)
+        return ERROR (l_result_d, "Failed to sync before closing");
 
     free (l_blocks_pz);
     *p_blocks_ppz = NULL;
@@ -232,6 +233,43 @@ extern int hl_blocks_r_write (
     if ((p_data_p == NULL) || (p_size_ud == 0))
         return ERROR (-1, "invalid parameters for hl_blocks_r_write(%p,%zu)", p_data_p, p_size_ud);
 
+    //ensure write will fit in remaining buffer space to avoid partial write
+    //also ensure there is always one block left for any heap writes to be synced
+    //if system shutsdown.
+    {
+        size_t                      l_remain_ud = p_size_ud;
+        uint32_t                    l_wr_blk_used_ud = p_blocks_pz->wr_blk_used_ud;
+        uint32_t                    l_sync_count_ud = 0;
+        while (l_remain_ud > 0)
+        {
+            //determine space left in current write buffer
+            size_t l_buffer_space_ud = p_blocks_pz->block_size_ud
+                - sizeof (blk_head_t)
+                - l_wr_blk_used_ud;
+
+            //determine min space required to write some/all into this block
+            if (sizeof (msg_head_t) + MIN (p_blocks_pz->min_data_per_part_ud, l_remain_ud)
+                    > l_buffer_space_ud)
+            {
+                //must write into next block
+                l_sync_count_ud ++;
+                if ((p_blocks_pz->wr_idx_ud + 1 + l_sync_count_ud) % p_blocks_pz->nr_blocks_ud == p_blocks_pz->rd_idx_ud)
+                {
+                    ERROR_LOG ("Do not write partial!");
+                    return ERROR (HL_BLOCKS_K_ERROR_NO_SPACE_LEFT_IN_BUFFER,
+                        "Not enough space left for this message");
+                }
+                l_buffer_space_ud = p_blocks_pz->block_size_ud - sizeof (blk_head_t);
+            }/*if cannot fit more into this block*/
+            uint32_t l_part_size_ud = (uint32_t)MIN(l_remain_ud, l_buffer_space_ud - sizeof (msg_head_t));
+            l_wr_blk_used_ud += (sizeof (msg_head_t) + l_part_size_ud);
+            l_remain_ud -= l_part_size_ud;
+        }/*while more to write*/
+
+        DEBUG ("sync=%u wr=%u rd=%u", l_sync_count_ud, p_blocks_pz->wr_idx_ud, p_blocks_pz->rd_idx_ud);
+    }//local scope
+
+    //write now
     const unsigned char*        l_next_puc = (const unsigned char*)p_data_p;
     size_t                      l_remain_ud = p_size_ud;
     uint32_t                    l_part_index_ud = 0;
@@ -246,10 +284,14 @@ extern int hl_blocks_r_write (
         if (sizeof (msg_head_t) + MIN (p_blocks_pz->min_data_per_part_ud, l_remain_ud)
                 > l_buffer_space_ud)
         {
-            if (hl_blocks_r_sync (p_blocks_pz) != 0)
-                return ERROR(-1, "Failed to sync before writing more data");
+            int l_result_d = hl_blocks_r_sync (p_blocks_pz);
+            if (l_result_d != 0)
+            {
+                ERROR_LOG ("SYNC failed");
+                return ERROR(l_result_d, "Failed to sync before writing more data");
+            }
             l_buffer_space_ud = p_blocks_pz->block_size_ud - sizeof (blk_head_t);
-        }/*if can fit more into this block*/
+        }/*if cannot fit more into this block*/
 
         //write message header
         msg_head_t* l_msg_head_pz = (msg_head_t*)(p_blocks_pz->wr_blk_data_auc + sizeof (blk_head_t) + p_blocks_pz->wr_blk_used_ud);
@@ -265,6 +307,15 @@ extern int hl_blocks_r_write (
             l_msg_head_pz->part_size_ud);
 
         p_blocks_pz->wr_blk_used_ud += (sizeof (msg_head_t) + l_msg_head_pz->part_size_ud);
+        DEBUG ("wrote->blk[%5u](seq=%10u now=%3u) msg(seq=%5u size=%5u part[%2u]=%5u)",
+            p_blocks_pz->wr_idx_ud,
+            p_blocks_pz->last_blk_seq_ud + 1,
+            p_blocks_pz->wr_blk_used_ud,
+            l_msg_head_pz->seq_ud,
+            l_msg_head_pz->tot_size_ud,
+            l_msg_head_pz->part_ud,
+            l_msg_head_pz->part_size_ud);
+
         l_next_puc  += l_msg_head_pz->part_size_ud;
         l_remain_ud -= l_msg_head_pz->part_size_ud;
         l_part_index_ud ++;
@@ -274,9 +325,6 @@ extern int hl_blocks_r_write (
     if (p_write_seq_pud != NULL)
         *p_write_seq_pud = p_blocks_pz->last_msg_seq_ud;
 
-    DEBUG ("wr msg seq=%u size=%u",
-        p_blocks_pz->last_msg_seq_ud,
-        p_size_ud);
     return SUCCESS ();
 }/*hl_blocks_r_write()*/
 
@@ -286,7 +334,15 @@ extern int hl_blocks_r_sync (
 {
     if (p_blocks_pz->wr_blk_used_ud > 0)
     {
-        //update the block header then
+        //check there is enough space not to overwrite unread messages
+        //this is when write index will increment to fall on same block as read index
+        if ((p_blocks_pz->wr_idx_ud + 1) % p_blocks_pz->nr_blocks_ud == p_blocks_pz->rd_idx_ud)
+            return ERROR (HL_BLOCKS_K_ERROR_NO_SPACE_LEFT_IN_BUFFER,
+                "No space left in buffer wr_idx=%u rd_idx=%u",
+                p_blocks_pz->wr_idx_ud,
+                p_blocks_pz->rd_idx_ud);
+
+        //update the block header
         //sync the buffer to flash memory and start a new clean buffer
         blk_head_t* l_blk_head_pz = (blk_head_t*)(p_blocks_pz->wr_blk_data_auc);
         l_blk_head_pz->seq_ud = p_blocks_pz->last_blk_seq_ud + 1;
@@ -299,14 +355,14 @@ extern int hl_blocks_r_sync (
                 "Failed to sync write to flash blk[%u]",
                 p_blocks_pz->wr_idx_ud);
 
-        DEBUG ("synced blk[%u].seq=%u,used=%u to flash",
+        DEBUG ("synced blk[%5u](seq=%10u tot=%3u) -> FLASH",
             p_blocks_pz->wr_idx_ud,
             l_blk_head_pz->seq_ud,
             l_blk_head_pz->used_size_ud);
 
-        p_blocks_pz->last_blk_seq_ud++;
-        p_blocks_pz->wr_count_ud++;
-        p_blocks_pz->wr_idx_ud++;
+        p_blocks_pz->last_blk_seq_ud ++;
+        p_blocks_pz->wr_count_ud ++;
+        p_blocks_pz->wr_idx_ud = (p_blocks_pz->wr_idx_ud + 1) % p_blocks_pz->nr_blocks_ud;
         p_blocks_pz->wr_blk_used_ud = 0;
         memset (p_blocks_pz->wr_blk_data_auc, 0, p_blocks_pz->block_size_ud);
     }/*if buffer used*/
@@ -390,10 +446,9 @@ extern int hl_blocks_r_read (
 
             if (l_read_from_flash_ud)
             {
-                p_blocks_pz->rd_idx_ud ++; //next read start in next block
+                p_blocks_pz->rd_idx_ud ++; //next read start in next block: todo: check for end of buffer
                 p_blocks_pz->rd_ofs_ud = 0;
             }
-
             return ERROR (-1, "data corrupted - see error log");
         }//if corrupted
 
@@ -429,6 +484,15 @@ extern int hl_blocks_r_read (
 
         if (l_read_from_flash_ud)
         {
+            DEBUG ("read<--blk[%5u](seq=%10u rem=%3u) msg(seq=%5u size=%5u part[%2u]=%5u)",
+                p_blocks_pz->rd_idx_ud,
+                l_flash_blk_head_pz->seq_ud,
+                l_flash_blk_head_pz->used_size_ud - p_blocks_pz->rd_ofs_ud - sizeof (msg_head_t) - l_msg_head_pz->part_size_ud,
+                l_msg_head_pz->seq_ud,
+                l_msg_head_pz->tot_size_ud,
+                l_msg_head_pz->part_ud,
+                l_msg_head_pz->part_size_ud);
+
             //update the flash read offset and block to skip over this message
             if (p_blocks_pz->rd_ofs_ud + sizeof (msg_head_t) + l_msg_head_pz->part_size_ud
                     >= l_flash_blk_head_pz->used_size_ud)
@@ -438,7 +502,7 @@ extern int hl_blocks_r_read (
                 (*p_blocks_pz->write_pr) (p_blocks_pz->rd_idx_ud, l_flash_blk_head_pz);
 
                 p_blocks_pz->rd_ofs_ud = 0;
-                p_blocks_pz->rd_idx_ud ++;
+                p_blocks_pz->rd_idx_ud = (p_blocks_pz->rd_idx_ud + 1) % p_blocks_pz->nr_blocks_ud;
             } else {
                 p_blocks_pz->rd_ofs_ud += sizeof (msg_head_t) + l_msg_head_pz->part_size_ud;
             }
@@ -455,15 +519,20 @@ extern int hl_blocks_r_read (
                     p_blocks_pz->wr_blk_used_ud - l_head_and_data_size_ud);
             }/*if something to move*/
             p_blocks_pz->wr_blk_used_ud -= l_head_and_data_size_ud;
+
+            DEBUG ("read<--heap      (seq=%10u used=%3u) msg(seq=%5u size=%5u part[%2u]=%5u)",
+                //p_blocks_pz->rd_idx_ud,
+                p_blocks_pz->last_blk_seq_ud,
+                p_blocks_pz->wr_blk_used_ud,
+                l_msg_head_pz->seq_ud,
+                l_msg_head_pz->tot_size_ud,
+                l_msg_head_pz->part_ud,
+                l_msg_head_pz->part_size_ud);
         }/*if read from heap*/
 
         if (l_buff_ofs_ud >= l_tot_size_ud)
-        {
-            DEBUG ("rd msg seq=%u size=%u",
-                l_msg_head_pz->seq_ud,
-                *p_read_size_pud);
             return SUCCESS();   //got the whole message
-        }/*if done*/
+
     }//while reading message parts
     return ERROR (-1, "Not expected to get here!");
 }/*hl_blocks_r_read()*/
