@@ -198,8 +198,6 @@ TEST(first_msg_span_into_2nd_block) {
         64,     //max message size
         32);    //min data per message part
 
-
-
     //write message that, along with its header, does not fit
     //block if 64 bytes: blk_head(8) + msg_head(8) + data
     //                   0..7          8..15     16..63 (max 63-16=47)
